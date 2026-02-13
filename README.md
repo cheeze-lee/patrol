@@ -344,26 +344,309 @@ MIT License - 자세한 내용은 [LICENSE](LICENSE) 파일 참고
 - **Issues**: [GitHub Issues](https://github.com/cheeze-lee/patrol/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/cheeze-lee/patrol/discussions)
 
-## 🗺️ 로드맵
+## 🔗 Sink 연동 가이드
 
-### v1.1 (예정)
-- [ ] Webhook 발송 기능 (Slack, Discord, Teams)
-- [ ] 오류 분석 히스토리 및 통계
-- [ ] 다중 언어 지원 (Go, Java, Rust)
+### 1. 레포지토리 사전 연결
 
-### v1.2 (예정)
-- [ ] 실시간 대시보드
-- [ ] 팀 협업 기능
-- [ ] 커스텀 분석 규칙
+Patrol이 오류 분석 시 소스 코드에 접근하려면 GitHub 레포지토리를 사전에 연결해야 합니다.
 
-### v2.0 (예정)
-- [ ] 머신러닝 기반 오류 예측
-- [ ] 자동 패치 생성
-- [ ] IDE 플러그인
+#### 1.1 Lambda 환경변수에 레포 URL 설정
+
+```bash
+# Lambda 함수 업데이트
+aws lambda update-function-configuration \
+  --function-name patrol-error-analyzer \
+  --environment Variables={\
+OPENAI_API_KEY=sk_...,\
+GITHUB_TOKEN=ghp_...,\
+DEFAULT_REPOSITORY_URL=https://github.com/your-org/your-repo\
+}
+```
+
+#### 1.2 런타임 중 레포 URL 지정
+
+오류 로그 이벤트에 `repositoryUrl` 필드를 포함하여 동적으로 레포를 지정할 수 있습니다:
+
+```json
+{
+  "eventId": "error-123",
+  "timestamp": 1707817200000,
+  "errorLog": {
+    "message": "TypeError: Cannot read property of undefined",
+    "filePath": "src/handlers/user.ts",
+    "lineNumber": 45
+  },
+  "repositoryUrl": "https://github.com/your-org/your-repo"
+}
+```
+
+### 2. Sink에서 Lambda 핸들러 연동
+
+#### 2.1 SQS를 통한 연동 (권장)
+
+**Step 1: SQS 큐 생성**
+```bash
+aws sqs create-queue --queue-name patrol-error-logs
+```
+
+**Step 2: Lambda를 SQS 트리거로 설정**
+```bash
+aws lambda create-event-source-mapping \
+  --event-source-arn arn:aws:sqs:region:account-id:patrol-error-logs \
+  --function-name patrol-error-analyzer \
+  --batch-size 10 \
+  --batch-window 5
+```
+
+**Step 3: Sink에서 SQS로 메시지 발송**
+
+Sink 설정에서 오류 로그를 다음 형식으로 SQS에 발송:
+
+```python
+import json
+import boto3
+
+sqs = boto3.client('sqs')
+
+def send_error_to_patrol(error_log, repository_url):
+    """Sink에서 오류 로그를 Patrol로 발송"""
+    message = {
+        'eventId': error_log['id'],
+        'timestamp': int(time.time() * 1000),
+        'errorLog': {
+            'message': error_log['message'],
+            'code': error_log.get('code'),
+            'filePath': error_log.get('file_path'),
+            'lineNumber': error_log.get('line_number'),
+            'stackTrace': error_log.get('stack_trace'),
+            'context': error_log.get('context'),
+        },
+        'repositoryUrl': repository_url,
+    }
+    
+    sqs.send_message(
+        QueueUrl='https://sqs.region.amazonaws.com/account-id/patrol-error-logs',
+        MessageBody=json.dumps(message),
+    )
+```
+
+#### 2.2 SNS를 통한 연동
+
+**Step 1: SNS 토픽 생성**
+```bash
+aws sns create-topic --name patrol-error-logs
+```
+
+**Step 2: Lambda를 SNS 구독자로 설정**
+```bash
+aws sns subscribe \
+  --topic-arn arn:aws:sns:region:account-id:patrol-error-logs \
+  --protocol lambda \
+  --notification-endpoint arn:aws:lambda:region:account-id:function:patrol-error-analyzer
+```
+
+**Step 3: Sink에서 SNS로 메시지 발송**
+
+```python
+import json
+import boto3
+
+sns = boto3.client('sns')
+
+def send_error_to_patrol(error_log, repository_url):
+    """Sink에서 오류 로그를 Patrol로 발송"""
+    message = {
+        'eventId': error_log['id'],
+        'timestamp': int(time.time() * 1000),
+        'errorLog': {
+            'message': error_log['message'],
+            'code': error_log.get('code'),
+            'filePath': error_log.get('file_path'),
+            'lineNumber': error_log.get('line_number'),
+            'stackTrace': error_log.get('stack_trace'),
+        },
+        'repositoryUrl': repository_url,
+    }
+    
+    sns.publish(
+        TopicArn='arn:aws:sns:region:account-id:patrol-error-logs',
+        Message=json.dumps(message),
+    )
+```
+
+#### 2.3 EventBridge를 통한 연동
+
+**Step 1: EventBridge 규칙 생성**
+```bash
+aws events put-rule \
+  --name patrol-error-rule \
+  --event-pattern '{"source": ["custom.errors"], "detail-type": ["Error Log"]}'
+```
+
+**Step 2: Lambda를 대상으로 설정**
+```bash
+aws events put-targets \
+  --rule patrol-error-rule \
+  --targets "Id"="1","Arn"="arn:aws:lambda:region:account-id:function:patrol-error-analyzer"
+```
+
+**Step 3: Sink에서 EventBridge로 이벤트 발송**
+
+```python
+import json
+import boto3
+
+events = boto3.client('events')
+
+def send_error_to_patrol(error_log, repository_url):
+    """Sink에서 오류 로그를 Patrol로 발송"""
+    event_detail = {
+        'eventId': error_log['id'],
+        'timestamp': int(time.time() * 1000),
+        'errorLog': {
+            'message': error_log['message'],
+            'code': error_log.get('code'),
+            'filePath': error_log.get('file_path'),
+            'lineNumber': error_log.get('line_number'),
+            'stackTrace': error_log.get('stack_trace'),
+        },
+        'repositoryUrl': repository_url,
+    }
+    
+    events.put_events(
+        Entries=[
+            {
+                'Source': 'custom.errors',
+                'DetailType': 'Error Log',
+                'Detail': json.dumps(event_detail),
+            }
+        ]
+    )
+```
+
+### 3. Lambda 응답 처리
+
+Patrol Lambda 핸들러는 다음 형식의 응답을 반환합니다:
+
+```json
+{
+  "statusCode": 200,
+  "body": {
+    "processed": 1,
+    "failed": 0,
+    "results": [
+      {
+        "eventId": "error-123",
+        "errorHash": "abc123def456...",
+        "analysis": "Detailed analysis of the error",
+        "rootCause": "User object is null",
+        "suggestedFix": "Add null check before accessing properties",
+        "confidenceScore": 85,
+        "analyzedAt": 1707817200000
+      }
+    ],
+    "cacheStats": {
+      "hits": 5,
+      "misses": 2,
+      "hitRate": 0.714,
+      "size": 7,
+      "maxSize": 1000,
+      "utilizationPercent": 0.7
+    }
+  }
+}
+```
+
+### 4. 완전한 예제: Sink에서 Lambda로 오류 분석
+
+```python
+import json
+import time
+import boto3
+from typing import Dict, Any
+
+class ErrorSink:
+    """오류 로그를 Patrol Lambda로 전송하는 Sink"""
+    
+    def __init__(self, queue_url: str, repository_url: str):
+        self.sqs = boto3.client('sqs')
+        self.queue_url = queue_url
+        self.repository_url = repository_url
+    
+    def process_error(self, error: Dict[str, Any]) -> None:
+        """오류를 처리하고 Patrol로 전송"""
+        message = {
+            'eventId': error.get('id', f'error-{int(time.time() * 1000)}'),
+            'timestamp': int(time.time() * 1000),
+            'errorLog': {
+                'message': error['message'],
+                'code': error.get('code'),
+                'filePath': error.get('file_path'),
+                'lineNumber': error.get('line_number'),
+                'stackTrace': error.get('stack_trace'),
+                'context': error.get('context'),
+            },
+            'repositoryUrl': self.repository_url,
+        }
+        
+        # SQS로 전송
+        self.sqs.send_message(
+            QueueUrl=self.queue_url,
+            MessageBody=json.dumps(message),
+        )
+        
+        print(f'[Sink] Error sent to Patrol: {message["eventId"]}')
+
+
+# 사용 예제
+if __name__ == '__main__':
+    sink = ErrorSink(
+        queue_url='https://sqs.us-east-1.amazonaws.com/123456789/patrol-error-logs',
+        repository_url='https://github.com/your-org/your-repo',
+    )
+    
+    # 오류 발생
+    error = {
+        'id': 'error-001',
+        'message': 'TypeError: Cannot read property of undefined',
+        'code': 'ERR_UNDEFINED',
+        'file_path': 'src/handlers/user.ts',
+        'line_number': 45,
+        'stack_trace': 'at getUserById (src/handlers/user.ts:45:15)',
+        'context': {'userId': 'user-123'},
+    }
+    
+    sink.process_error(error)
+```
+
+### 5. 모니터링 및 디버깅
+
+**Lambda 로그 확인**
+```bash
+aws logs tail /aws/lambda/patrol-error-analyzer --follow
+```
+
+**SQS 메시지 확인**
+```bash
+aws sqs receive-message \
+  --queue-url https://sqs.region.amazonaws.com/account-id/patrol-error-logs \
+  --max-number-of-messages 10
+```
+
+**캐시 히트율 모니터링**
+```bash
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/patrol-error-analyzer \
+  --filter-pattern "Cache hit" \
+  --query 'events[*].message'
+```
 
 ## 📚 추가 자료
 
 - [AWS Lambda 개발자 가이드](https://docs.aws.amazon.com/lambda/)
+- [AWS SQS 개발자 가이드](https://docs.aws.amazon.com/sqs/)
+- [AWS SNS 개발자 가이드](https://docs.aws.amazon.com/sns/)
+- [AWS EventBridge 개발자 가이드](https://docs.aws.amazon.com/eventbridge/)
 - [OpenAI API 문서](https://platform.openai.com/docs/)
 - [GitHub API 문서](https://docs.github.com/en/rest)
 
