@@ -1,10 +1,12 @@
 """
 AWS Lambda Handler for Patrol Error Analysis System
+Supports OTEL logs from Vector Sink
 """
 
 import json
 import os
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
 # Import core modules
@@ -13,6 +15,7 @@ from engine import ErrorAnalysisEngine
 from cache import InMemoryCache
 from openai_provider import OpenAILLMProvider
 from github_provider import GitHubRepositoryCodeProvider
+from otel_parser import OTELLogParser, VectorOTELSinkHandler
 
 
 # Initialize engine (reused across Lambda invocations)
@@ -46,6 +49,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     AWS Lambda handler for error analysis
     
     Supports:
+    - OTEL logs from Vector Sink (HTTP POST)
     - SQS events
     - SNS events
     - EventBridge events
@@ -125,15 +129,41 @@ def _parse_event(event: Dict[str, Any]) -> List[ErrorLogEvent]:
     """Parse event from different sources"""
     error_events = []
     
+    # OTEL event from Vector Sink (HTTP POST)
+    if 'resourceLogs' in event:
+        try:
+            otel_event = OTELLogParser.parse_otel_log(event)
+            if otel_event:
+                error_events.append(otel_event)
+        except Exception as e:
+            print(f'[Lambda] Failed to parse OTEL event: {e}')
+        return error_events
+    
+    # Batch OTEL events
+    if 'logs' in event and isinstance(event.get('logs'), (list, dict)):
+        try:
+            batch_events = VectorOTELSinkHandler.parse_vector_payload(event)
+            error_events.extend([e for e in batch_events if e])
+        except Exception as e:
+            print(f'[Lambda] Failed to parse OTEL batch: {e}')
+        return error_events
+    
     # SQS event
     if 'Records' in event and event['Records']:
         for record in event['Records']:
             if 'body' in record:
                 try:
                     body = json.loads(record['body'])
-                    error_event = _parse_error_event(body)
-                    if error_event:
-                        error_events.append(error_event)
+                    
+                    # Check if body contains OTEL log
+                    if 'resourceLogs' in body:
+                        otel_event = OTELLogParser.parse_otel_log(body)
+                        if otel_event:
+                            error_events.append(otel_event)
+                    else:
+                        error_event = _parse_error_event(body)
+                        if error_event:
+                            error_events.append(error_event)
                 except Exception as e:
                     print(f'[Lambda] Failed to parse SQS record: {e}')
     
@@ -143,18 +173,31 @@ def _parse_event(event: Dict[str, Any]) -> List[ErrorLogEvent]:
             if 'Sns' in record:
                 try:
                     message = json.loads(record['Sns']['Message'])
-                    error_event = _parse_error_event(message)
-                    if error_event:
-                        error_events.append(error_event)
+                    
+                    # Check if message contains OTEL log
+                    if 'resourceLogs' in message:
+                        otel_event = OTELLogParser.parse_otel_log(message)
+                        if otel_event:
+                            error_events.append(otel_event)
+                    else:
+                        error_event = _parse_error_event(message)
+                        if error_event:
+                            error_events.append(error_event)
                 except Exception as e:
                     print(f'[Lambda] Failed to parse SNS record: {e}')
     
     # EventBridge event
     elif 'detail' in event:
         try:
-            error_event = _parse_error_event(event['detail'])
-            if error_event:
-                error_events.append(error_event)
+            # Check if detail contains OTEL log
+            if 'resourceLogs' in event['detail']:
+                otel_event = OTELLogParser.parse_otel_log(event['detail'])
+                if otel_event:
+                    error_events.append(otel_event)
+            else:
+                error_event = _parse_error_event(event['detail'])
+                if error_event:
+                    error_events.append(error_event)
         except Exception as e:
             print(f'[Lambda] Failed to parse EventBridge event: {e}')
     
@@ -198,18 +241,47 @@ def _parse_error_event(data: Dict[str, Any]) -> Optional[ErrorLogEvent]:
 
 # For local testing
 if __name__ == '__main__':
-    test_event = {
-        'eventId': 'test-error-001',
-        'timestamp': int(__import__('time').time() * 1000),
-        'errorLog': {
-            'message': 'TypeError: Cannot read property of undefined',
-            'code': 'ERR_UNDEFINED',
-            'filePath': 'src/handlers/user.ts',
-            'lineNumber': 45,
-            'stackTrace': 'at getUserById (src/handlers/user.ts:45:15)',
-        },
-        'repositoryUrl': 'https://github.com/your-org/your-repo',
+    # Test OTEL event
+    otel_event = {
+        'resourceLogs': [
+            {
+                'resource': {
+                    'attributes': {
+                        'service.name': 'my-service',
+                        'service.version': '1.0.0',
+                        'git.repository.url': 'https://github.com/your-org/your-repo',
+                    }
+                },
+                'scopeLogs': [
+                    {
+                        'scope': {
+                            'name': 'my-logger',
+                            'version': '1.0.0'
+                        },
+                        'logRecords': [
+                            {
+                                'timeUnixNano': str(int(time.time() * 1e9)),
+                                'severityNumber': 17,
+                                'severityText': 'ERROR',
+                                'body': {
+                                    'stringValue': 'TypeError: Cannot read property of undefined'
+                                },
+                                'attributes': {
+                                    'exception.type': 'TypeError',
+                                    'exception.message': 'Cannot read property of undefined',
+                                    'exception.stacktrace': 'at getUserById (src/handlers/user.ts:45:15)',
+                                    'code.filepath': 'src/handlers/user.ts',
+                                    'code.lineno': 45,
+                                },
+                                'traceId': 'abc123def456',
+                                'spanId': 'def456ghi789',
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
     }
     
-    result = handler(test_event, None)
+    result = handler(otel_event, None)
     print(json.dumps(result, indent=2))
