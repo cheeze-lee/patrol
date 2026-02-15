@@ -10,7 +10,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 # Import core modules
-from types import ErrorLogEvent, ErrorLog, ProcessingOptions
+from patrol_types import ErrorLogEvent, ErrorLog, ProcessingOptions
 from engine import ErrorAnalysisEngine
 from cache import InMemoryCache
 from openai_provider import OpenAILLMProvider
@@ -128,6 +128,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 def _parse_event(event: Dict[str, Any]) -> List[ErrorLogEvent]:
     """Parse event from different sources"""
     error_events = []
+    default_repo_url = os.getenv('DEFAULT_REPOSITORY_URL')
+    repo_url_map = _load_repository_url_map()
     
     # OTEL event from Vector Sink (HTTP POST)
     if 'resourceLogs' in event:
@@ -137,6 +139,7 @@ def _parse_event(event: Dict[str, Any]) -> List[ErrorLogEvent]:
                 error_events.append(otel_event)
         except Exception as e:
             print(f'[Lambda] Failed to parse OTEL event: {e}')
+        _apply_repository_routing(error_events, repo_url_map, default_repo_url)
         return error_events
     
     # Batch OTEL events
@@ -146,6 +149,7 @@ def _parse_event(event: Dict[str, Any]) -> List[ErrorLogEvent]:
             error_events.extend([e for e in batch_events if e])
         except Exception as e:
             print(f'[Lambda] Failed to parse OTEL batch: {e}')
+        _apply_repository_routing(error_events, repo_url_map, default_repo_url)
         return error_events
     
     # SQS event
@@ -210,6 +214,7 @@ def _parse_event(event: Dict[str, Any]) -> List[ErrorLogEvent]:
         except Exception as e:
             print(f'[Lambda] Failed to parse direct event: {e}')
     
+    _apply_repository_routing(error_events, repo_url_map, default_repo_url)
     return error_events
 
 
@@ -217,12 +222,18 @@ def _parse_error_event(data: Dict[str, Any]) -> Optional[ErrorLogEvent]:
     """Parse error event from data"""
     try:
         error_log_data = data.get('errorLog', {})
+
+        line_number_raw = error_log_data.get('lineNumber')
+        try:
+            line_number = int(line_number_raw) if line_number_raw is not None else None
+        except (TypeError, ValueError):
+            line_number = None
         
         error_log = ErrorLog(
             message=error_log_data.get('message', ''),
             code=error_log_data.get('code'),
             file_path=error_log_data.get('filePath'),
-            line_number=error_log_data.get('lineNumber'),
+            line_number=line_number,
             stack_trace=error_log_data.get('stackTrace'),
             context=error_log_data.get('context'),
         )
@@ -237,6 +248,89 @@ def _parse_error_event(data: Dict[str, Any]) -> Optional[ErrorLogEvent]:
     except Exception as e:
         print(f'[Lambda] Failed to parse error event: {e}')
         return None
+
+
+def _load_repository_url_map() -> Dict[str, str]:
+    """
+    Load repository routing map from env.
+
+    Example:
+      REPOSITORY_URL_MAP='{"service-a":"https://github.com/org/repo-a","service-b":"https://github.com/org/repo-b"}'
+    """
+    raw = (
+        os.getenv('REPOSITORY_URL_MAP')
+        or os.getenv('SERVICE_REPOSITORY_URL_MAP')
+    )
+    if not raw:
+        return {}
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        print('[Lambda] Failed to parse REPOSITORY_URL_MAP (expected JSON object)')
+        return {}
+
+    if not isinstance(data, dict):
+        print('[Lambda] REPOSITORY_URL_MAP must be a JSON object')
+        return {}
+
+    # Only keep string -> string entries.
+    mapped: Dict[str, str] = {}
+    for k, v in data.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        k = k.strip()
+        v = v.strip()
+        if not k or not v:
+            continue
+        mapped[k] = v
+
+    return mapped
+
+
+def _resolve_repository_url(
+    error_event: ErrorLogEvent,
+    repo_url_map: Dict[str, str],
+    default_repo_url: Optional[str],
+) -> Optional[str]:
+    if error_event.repository_url:
+        return error_event.repository_url
+
+    ctx = error_event.error_log.context
+    if isinstance(ctx, dict):
+        # Direct repository URL hints in context.
+        for key in (
+            'git.repository.url',
+            'vcs.repository.url',
+            'repository.url',
+            'repo.url',
+            'repositoryUrl',
+        ):
+            value = ctx.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        service_name = ctx.get('service.name') or ctx.get('service_name') or ctx.get('serviceName')
+        if isinstance(service_name, str) and service_name.strip():
+            svc = service_name.strip()
+            if svc in repo_url_map:
+                return repo_url_map[svc]
+            # Convenience: allow case-insensitive matching.
+            lower_map = {k.lower(): v for k, v in repo_url_map.items()}
+            mapped = lower_map.get(svc.lower())
+            if mapped:
+                return mapped
+
+    return default_repo_url
+
+
+def _apply_repository_routing(
+    error_events: List[ErrorLogEvent],
+    repo_url_map: Dict[str, str],
+    default_repo_url: Optional[str],
+) -> None:
+    for e in error_events:
+        e.repository_url = _resolve_repository_url(e, repo_url_map, default_repo_url)
 
 
 # For local testing

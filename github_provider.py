@@ -7,8 +7,11 @@ import re
 import time
 import base64
 from typing import Optional, Dict, List
-import requests
-from types import NormalizedErrorLog
+from urllib.parse import quote
+try:
+    import requests  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    requests = None  # type: ignore
 
 
 class GitHubRepositoryCodeProvider:
@@ -22,8 +25,6 @@ class GitHubRepositoryCodeProvider:
             token: GitHub Personal Access Token (defaults to GITHUB_TOKEN env var)
         """
         self.token = token or os.getenv('GITHUB_TOKEN')
-        if not self.token:
-            raise ValueError('GITHUB_TOKEN environment variable is not set')
         
         self.base_url = 'https://api.github.com'
         self.max_retries = 3
@@ -31,14 +32,14 @@ class GitHubRepositoryCodeProvider:
         self.code_cache: Dict[str, tuple[str, int]] = {}
         self.cache_ttl_ms = 3600000  # 1 hour
     
-    def get_file_content(self, repo_url: str, file_path: str) -> str:
+    def get_file_content(self, repo_url: str, file_path: str, ref: Optional[str] = None) -> str:
         """Get file content from repository"""
         try:
             owner, repo = self._parse_repository_url(repo_url)
             if not owner or not repo:
                 raise ValueError(f'Invalid repository URL: {repo_url}')
             
-            return self._fetch_file_content(owner, repo, file_path)
+            return self._fetch_file_content(owner, repo, file_path, ref=ref)
         except Exception as e:
             print(f'[GitHub] Failed to get file content: {e}')
             raise
@@ -77,9 +78,9 @@ class GitHubRepositoryCodeProvider:
             print(f'[GitHub] Failed to get repo metadata: {e}')
             return {}
     
-    def _fetch_file_content(self, owner: str, repo: str, file_path: str) -> str:
+    def _fetch_file_content(self, owner: str, repo: str, file_path: str, ref: Optional[str] = None) -> str:
         """Fetch file content from GitHub"""
-        cache_key = f'{owner}/{repo}/{file_path}'
+        cache_key = f'{owner}/{repo}/{ref or "default"}/{file_path}'
         
         # Check cache
         if cache_key in self.code_cache:
@@ -89,6 +90,8 @@ class GitHubRepositoryCodeProvider:
                 return content
         
         url = f'{self.base_url}/repos/{owner}/{repo}/contents/{file_path}'
+        if ref:
+            url = f'{url}?ref={quote(ref, safe="")}'
         response = self._make_request(url)
         
         if response and response.get('type') == 'file' and response.get('content'):
@@ -106,7 +109,8 @@ class GitHubRepositoryCodeProvider:
             
             for keyword in keywords[:3]:
                 try:
-                    url = f'{self.base_url}/search/code?q=repo:{owner}/{repo}+{keyword}+language:python+language:typescript+language:javascript'
+                    # Keep the query broad; callers can post-filter and/or request specific paths.
+                    url = f'{self.base_url}/search/code?q=repo:{owner}/{repo}+{keyword}'
                     response = self._make_request(url)
                     
                     if response and response.get('items'):
@@ -140,11 +144,15 @@ class GitHubRepositoryCodeProvider:
     def _make_request(self, url: str, retry_count: int = 0) -> Optional[Dict]:
         """Make authenticated request to GitHub API"""
         try:
+            if requests is None:
+                raise ModuleNotFoundError('requests package is not installed (pip install -r requirements.txt)')
+
             headers = {
-                'Authorization': f'token {self.token}',
                 'Accept': 'application/vnd.github.v3.raw+json',
                 'User-Agent': 'Patrol-Error-Analyzer',
             }
+            if self.token:
+                headers['Authorization'] = f'token {self.token}'
             
             response = requests.get(url, headers=headers, timeout=10)
             

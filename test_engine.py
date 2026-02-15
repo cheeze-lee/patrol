@@ -4,7 +4,7 @@ Unit tests for Patrol error analysis engine
 
 import unittest
 import time
-from types import ErrorLog, ErrorLogEvent, ProcessingOptions
+from patrol_types import ErrorLog, ErrorLogEvent, ProcessingOptions
 from hashing import hash_error_log, normalize_error_log
 from cache import InMemoryCache
 from engine import ErrorAnalysisEngine
@@ -59,7 +59,7 @@ class TestCache(unittest.TestCase):
     
     def test_cache_set_get(self):
         """Test cache set and get"""
-        from types import AnalysisResult
+        from patrol_types import AnalysisResult
         
         result = AnalysisResult(
             error_hash='test-hash',
@@ -80,7 +80,7 @@ class TestCache(unittest.TestCase):
     
     def test_cache_expiration(self):
         """Test cache expiration"""
-        from types import AnalysisResult
+        from patrol_types import AnalysisResult
         
         result = AnalysisResult(
             error_hash='test-hash',
@@ -96,7 +96,7 @@ class TestCache(unittest.TestCase):
     
     def test_cache_eviction_lru(self):
         """Test LRU eviction"""
-        from types import AnalysisResult
+        from patrol_types import AnalysisResult
         
         for i in range(5):
             result = AnalysisResult(
@@ -111,7 +111,7 @@ class TestCache(unittest.TestCase):
     
     def test_cache_stats(self):
         """Test cache statistics"""
-        from types import AnalysisResult
+        from patrol_types import AnalysisResult
         
         result = AnalysisResult(
             error_hash='test-hash',

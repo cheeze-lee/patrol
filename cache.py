@@ -4,7 +4,7 @@ In-memory cache management with MaxQueue support
 
 import time
 from typing import Optional, Dict, Tuple
-from types import AnalysisResult
+from patrol_types import AnalysisResult
 
 
 class InMemoryCache:

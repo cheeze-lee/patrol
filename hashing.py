@@ -5,7 +5,7 @@ Error log hashing and normalization
 import hashlib
 import re
 from typing import Optional
-from types import NormalizedErrorLog, ErrorLog
+from patrol_types import NormalizedErrorLog, ErrorLog
 
 
 def normalize_error_log(error_log: ErrorLog) -> NormalizedErrorLog:

@@ -6,40 +6,69 @@ import os
 import json
 import time
 from typing import Optional, Dict, Any
-from openai import OpenAI
-from types import NormalizedErrorLog, AnalysisResult
+from patrol_types import ErrorLog, AnalysisResult
+
+try:
+    from openai import OpenAI  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    OpenAI = None  # type: ignore
 
 
 class OpenAILLMProvider:
     """OpenAI LLM provider for error analysis"""
     
-    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        organization: Optional[str] = None,
+        base_url: Optional[str] = None,
+    ):
         """
         Initialize OpenAI provider
         
         Args:
             api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
             model: Model name (defaults to OPENAI_MODEL env var or 'gpt-4')
+            organization: OpenAI organization id (optional; defaults to env var)
+            base_url: OpenAI base URL (optional; defaults to env var)
         """
         self.api_key = api_key or os.getenv('OPENAI_API_KEY')
-        if not self.api_key:
-            raise ValueError('OPENAI_API_KEY environment variable is not set')
-        
         self.model = model or os.getenv('OPENAI_MODEL', 'gpt-4')
-        self.client = OpenAI(api_key=self.api_key)
+        self.organization = (
+            organization
+            or os.getenv('OPENAI_ORG_ID')
+            or os.getenv('OPENAI_ORGANIZATION')
+            or os.getenv('OPENAI_ORGANIZATION_ID')
+        )
+        self.base_url = base_url or os.getenv('OPENAI_BASE_URL') or os.getenv('OPENAI_API_BASE')
+
+        self.client = None
+        if OpenAI and self.api_key:
+            client_kwargs: Dict[str, Any] = {'api_key': self.api_key}
+            if self.organization:
+                client_kwargs['organization'] = self.organization
+            if self.base_url:
+                client_kwargs['base_url'] = self.base_url
+            try:
+                self.client = OpenAI(**client_kwargs)
+            except TypeError:
+                # Older client versions may not accept organization/base_url kwargs.
+                self.client = OpenAI(api_key=self.api_key)
         self.max_retries = 3
         self.retry_delay_ms = 1000
     
     def analyze_error(
         self,
-        normalized_error: NormalizedErrorLog,
-        repository_code: Optional[str] = None
+        error_hash: str,
+        error_log: ErrorLog,
+        repository_context: Optional[str] = None,
     ) -> AnalysisResult:
         """
         Analyze error using OpenAI API
         """
         system_prompt = self._build_system_prompt()
-        user_prompt = self._build_user_prompt(normalized_error, repository_code)
+        user_prompt = self._build_user_prompt(error_hash, error_log, repository_context)
         
         try:
             response = self._call_openai([
@@ -51,7 +80,7 @@ class OpenAILLMProvider:
             root_cause, suggested_fix, confidence_score = self._parse_analysis(analysis)
             
             return AnalysisResult(
-                error_hash=normalized_error.error_hash,
+                error_hash=error_hash,
                 analysis=analysis,
                 root_cause=root_cause,
                 suggested_fix=suggested_fix,
@@ -66,6 +95,11 @@ class OpenAILLMProvider:
     
     def _call_openai(self, messages: list) -> Any:
         """Call OpenAI API with retry logic"""
+        if OpenAI is None:
+            raise ModuleNotFoundError('openai package is not installed (pip install -r requirements.txt)')
+        if self.client is None:
+            raise ValueError('OPENAI_API_KEY environment variable is not set')
+
         last_error = None
         
         for attempt in range(self.max_retries):
@@ -104,34 +138,35 @@ Be concise but thorough. Focus on actionable insights."""
     
     def _build_user_prompt(
         self,
-        normalized_error: NormalizedErrorLog,
-        repository_code: Optional[str] = None
+        error_hash: str,
+        error_log: ErrorLog,
+        repository_context: Optional[str] = None,
     ) -> str:
         """Build user prompt with error details"""
         prompt = 'Analyze the following error:\n\n'
-        prompt += f'Error Message: {normalized_error.error_message}\n'
+        prompt += f'Error Hash: {error_hash}\n'
+        prompt += f'Error Message: {error_log.message}\n'
         
-        if normalized_error.error_code:
-            prompt += f'Error Code: {normalized_error.error_code}\n'
+        if error_log.code:
+            prompt += f'Error Code: {error_log.code}\n'
         
-        if normalized_error.file_path:
-            prompt += f'File: {normalized_error.file_path}'
-            if normalized_error.line_number:
-                prompt += f':{normalized_error.line_number}'
+        if error_log.file_path:
+            prompt += f'File: {error_log.file_path}'
+            if error_log.line_number:
+                prompt += f':{error_log.line_number}'
             prompt += '\n'
         
-        if normalized_error.stack_trace:
-            prompt += f'Stack Trace:\n{normalized_error.stack_trace}\n'
+        if error_log.stack_trace:
+            prompt += f'Stack Trace:\n{error_log.stack_trace}\n'
         
-        if normalized_error.context:
+        if error_log.context:
             try:
-                context = json.loads(normalized_error.context)
-                prompt += f'Context: {json.dumps(context, indent=2)}\n'
-            except:
-                prompt += f'Context: {normalized_error.context}\n'
+                prompt += f'Context: {json.dumps(error_log.context, indent=2, default=str)}\n'
+            except Exception:
+                prompt += f'Context: {str(error_log.context)}\n'
         
-        if repository_code:
-            prompt += f'\nRelevant Code:\n{repository_code}\n'
+        if repository_context:
+            prompt += f'\nRepository Context:\n{repository_context}\n'
         
         prompt += '\nProvide the analysis in JSON format.'
         

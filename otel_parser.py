@@ -4,7 +4,7 @@ Parses OTEL logs from Vector Sink and converts to Patrol format
 """
 
 from typing import Optional, Dict, Any, List
-from types import ErrorLog, ErrorLogEvent
+from patrol_types import ErrorLog, ErrorLogEvent
 import json
 import time
 
@@ -88,11 +88,19 @@ class OTELLogParser:
             event_id = f"{trace_id}-{span_id}" if trace_id and span_id else f"otel-{int(time.time() * 1000)}"
             
             # Extract timestamp
-            time_unix_nano = log_record.get('timeUnixNano', 0)
-            timestamp = int(time_unix_nano / 1000000)  # Convert nanoseconds to milliseconds
+            time_unix_nano_raw = log_record.get('timeUnixNano', 0)
+            try:
+                time_unix_nano = int(time_unix_nano_raw)
+                timestamp = int(time_unix_nano / 1000000)  # Convert nanoseconds to milliseconds
+            except (TypeError, ValueError):
+                timestamp = int(time.time() * 1000)
             
             # Extract repository URL from resource attributes
-            repository_url = resource_attrs.get('git.repository.url')
+            repository_url = (
+                resource_attrs.get('git.repository.url')
+                or resource_attrs.get('vcs.repository.url')
+                or resource_attrs.get('repository.url')
+            )
             
             return ErrorLogEvent(
                 event_id=event_id,
@@ -134,7 +142,11 @@ class OTELLogParser:
         
         # Extract code location
         file_path = attributes.get('code.filepath')
-        line_number = attributes.get('code.lineno')
+        line_number_raw = attributes.get('code.lineno')
+        try:
+            line_number = int(line_number_raw) if line_number_raw is not None else None
+        except (TypeError, ValueError):
+            line_number = None
         
         # Extract context (all other attributes)
         context = {
@@ -145,6 +157,17 @@ class OTELLogParser:
         # Add resource attributes to context
         context['service.name'] = resource_attrs.get('service.name')
         context['service.version'] = resource_attrs.get('service.version')
+        # Include repo/revision hints if present (useful for fetching correct code revision).
+        for k in (
+            'git.repository.url',
+            'git.commit.sha',
+            'git.sha',
+            'vcs.repository.url',
+            'vcs.ref.head.name',
+            'vcs.ref.head.revision',
+        ):
+            if resource_attrs.get(k) is not None:
+                context[k] = resource_attrs.get(k)
         
         return ErrorLog(
             message=message or 'Unknown error',
