@@ -5,6 +5,8 @@ Error Analysis Engine - Core logic for error analysis
 import os
 import re
 import time
+import threading
+from concurrent.futures import Future
 from typing import Optional
 from patrol_types import (
     ErrorLog,
@@ -38,6 +40,9 @@ class ErrorAnalysisEngine:
         self.cache = cache or InMemoryCache(max_size=1000, eviction_policy='LRU')
         self.llm_provider = llm_provider or OpenAILLMProvider()
         self.code_provider = code_provider or GitHubRepositoryCodeProvider()
+        # In-process "singleflight" to avoid duplicate LLM calls under concurrency.
+        self._inflight_lock = threading.Lock()
+        self._inflight: dict[str, Future] = {}
     
     def process_error_log(
         self,
@@ -68,24 +73,38 @@ class ErrorAnalysisEngine:
                 if cached_result:
                     print(f'[Engine] Cache hit for {error_hash[:8]}...')
                     return cached_result
+
+            inflight_future, is_owner = self._get_or_create_inflight(cache_key)
+            if not is_owner:
+                print(f'[Engine] Waiting for in-flight analysis for {error_hash[:8]}...')
+                return inflight_future.result()
             
-            # Set up target repository context (best-effort).
-            repository_context = self._build_repository_context(event)
-            
-            # Analyze error using LLM
-            print(f'[Engine] Analyzing error with LLM...')
-            analysis_result = self.llm_provider.analyze_error(
-                error_hash,
-                event.error_log,
-                repository_context=repository_context,
-            )
-            
-            # Cache the result
-            self.cache.set(cache_key, analysis_result, ttl=options.cache_ttl)
-            
-            print(f'[Engine] Analysis complete (confidence: {analysis_result.confidence_score}%)')
-            
-            return analysis_result
+            try:
+                # Set up target repository context (best-effort).
+                repository_context = self._build_repository_context(event)
+
+                # Analyze error using LLM
+                print(f'[Engine] Analyzing error with LLM...')
+                analysis_result = self.llm_provider.analyze_error(
+                    error_hash,
+                    event.error_log,
+                    repository_context=repository_context,
+                )
+
+                # Cache the result (unless skipped)
+                if not options.skip_cache:
+                    self.cache.set(cache_key, analysis_result, ttl=options.cache_ttl)
+
+                inflight_future.set_result(analysis_result)
+
+                print(f'[Engine] Analysis complete (confidence: {analysis_result.confidence_score}%)')
+
+                return analysis_result
+            except Exception as e:
+                inflight_future.set_exception(e)
+                raise
+            finally:
+                self._clear_inflight(cache_key, inflight_future)
         
         except Exception as e:
             print(f'[Engine] Error processing log: {e}')
@@ -115,6 +134,21 @@ class ErrorAnalysisEngine:
     def clear_cache(self) -> None:
         """Clear cache"""
         self.cache.clear_expired()
+
+    def _get_or_create_inflight(self, key: str) -> tuple[Future, bool]:
+        with self._inflight_lock:
+            existing = self._inflight.get(key)
+            if existing is not None:
+                return existing, False
+            future: Future = Future()
+            self._inflight[key] = future
+            return future, True
+
+    def _clear_inflight(self, key: str, future: Future) -> None:
+        with self._inflight_lock:
+            current = self._inflight.get(key)
+            if current is future:
+                del self._inflight[key]
 
     def _build_repository_context(self, event: ErrorLogEvent) -> Optional[str]:
         """

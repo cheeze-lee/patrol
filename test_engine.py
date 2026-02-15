@@ -4,6 +4,7 @@ Unit tests for Patrol error analysis engine
 
 import unittest
 import time
+import threading
 from patrol_types import ErrorLog, ErrorLogEvent, ProcessingOptions
 from hashing import hash_error_log, normalize_error_log
 from cache import InMemoryCache
@@ -151,6 +152,63 @@ class TestEngine(unittest.TestCase):
         self.assertIn('misses', stats)
         self.assertIn('size', stats)
         self.assertIn('max_size', stats)
+
+
+class TestInFlightDedupe(unittest.TestCase):
+    def test_concurrent_same_error_is_analyzed_once_per_process(self):
+        from patrol_types import AnalysisResult
+
+        class DummyLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def analyze_error(self, error_hash, error_log, repository_context=None):
+                self.calls += 1
+                time.sleep(0.2)  # ensure overlap for the second thread
+                return AnalysisResult(
+                    error_hash=error_hash,
+                    analysis='{\"rootCause\":\"x\",\"suggestedFix\":\"y\",\"confidenceScore\":75,\"analysis\":\"z\"}',
+                    confidence_score=75,
+                )
+
+        cache = InMemoryCache(max_size=10)
+        llm = DummyLLM()
+        engine = ErrorAnalysisEngine(cache=cache, llm_provider=llm)
+
+        event = ErrorLogEvent(
+            event_id='e-1',
+            timestamp=0,
+            error_log=ErrorLog(
+                message='TypeError: boom',
+                file_path='src/a.ts',
+                line_number=10,
+                stack_trace='at fn (src/a.ts:10:2)',
+            ),
+            repository_url=None,
+        )
+
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                barrier.wait()
+                results.append(engine.process_error_log(event))
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(llm.calls, 1)
+        self.assertEqual(results[0].error_hash, results[1].error_hash)
 
 
 if __name__ == '__main__':
