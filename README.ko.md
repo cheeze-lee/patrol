@@ -41,9 +41,11 @@ patrol/
 ├── engine.py                    # 핵심 분석 엔진
 ├── openai_provider.py           # OpenAI LLM 통합
 ├── github_provider.py           # GitHub 코드 접근
+├── otel_parser.py               # OTEL 로그 파서
 ├── lambda_handler.py            # Lambda 핸들러
 ├── test_engine.py               # 단위 테스트
-└── test_otel_parser.py          # OTEL 파서 테스트
+├── test_otel_parser.py          # OTEL 파서 테스트
+└── test_lambda_handler.py       # Lambda 핸들러 라우팅 테스트
 ```
 
 ## 🚀 빠른 시작
@@ -101,6 +103,7 @@ export $(cat .env | xargs)
 # 단위 테스트 실행 (unittest)
 python3 test_engine.py
 python3 test_otel_parser.py
+python3 test_lambda_handler.py
 
 # Lambda 핸들러 로컬 테스트
 python3 lambda_handler.py
@@ -291,6 +294,7 @@ for result in results:
 # 모든 테스트 실행
 python3 test_engine.py
 python3 test_otel_parser.py
+python3 test_lambda_handler.py
 ```
 
 ## 🔒 보안 고려사항
@@ -375,6 +379,34 @@ MIT License - 자세한 내용은 [LICENSE](LICENSE) 파일 참고
 - **Discussions**: [GitHub Discussions](https://github.com/cheeze-lee/patrol/discussions)
 
 ## 🔗 Sink 연동 가이드
+
+Vector(OTEL) Sink를 사용해 OTEL 로그를 Patrol로 전달하는 방법은 별도 가이드에 정리되어 있습니다:
+
+- Vector 설정 가이드: [VECTOR_SINK_CONFIG.md](VECTOR_SINK_CONFIG.md)
+- 멀티 MS 환경:
+  - OTEL resource에 `service.name`을 포함시키고, `REPOSITORY_URL_MAP`으로 `service.name` -> 레포 URL 라우팅을 설정하는 것을 권장합니다.
+  - 가능하다면 OTEL resource에 `git.repository.url`도 포함시키면 이벤트 단위로 타겟 레포를 지정할 수 있습니다.
+
+최소 `vector.toml` 예시는 아래와 같습니다:
+
+```toml
+[sources.otel_receiver]
+type = "opentelemetry"
+address = "0.0.0.0:4317"
+protocol = "grpc"
+
+[transforms.filter_errors]
+type = "filter"
+inputs = ["otel_receiver"]
+condition = '.severity_text == "ERROR"'
+
+[sinks.patrol_lambda]
+type = "http"
+inputs = ["filter_errors"]
+uri = "https://YOUR_API_GATEWAY_URL/patrol"
+method = "post"
+encoding.codec = "json"
+```
 
 ### 1. 레포지토리 사전 연결
 

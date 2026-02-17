@@ -34,7 +34,8 @@ patrol/
 ├── otel_parser.py               # OTEL log parser
 ├── lambda_handler.py            # AWS Lambda handler
 ├── test_engine.py               # Unit tests (unittest)
-└── test_otel_parser.py          # OTEL parser tests (unittest)
+├── test_otel_parser.py          # OTEL parser tests (unittest)
+└── test_lambda_handler.py       # Lambda handler tests (unittest)
 ```
 
 ## Quick Start
@@ -87,6 +88,7 @@ export $(cat .env | xargs)
 ```bash
 python3 test_engine.py
 python3 test_otel_parser.py
+python3 test_lambda_handler.py
 ```
 
 ### 4. Local Lambda Handler Test
@@ -162,7 +164,34 @@ print(result.confidence_score)
 
 ## Sink Integration (OTEL / Vector)
 
-- Vector sink config guide: [VECTOR_SINK_CONFIG.md](VECTOR_SINK_CONFIG.md) (Korean)
-- If you can, include the repository URL in OTEL resource attributes as `git.repository.url`.
-- If you cannot, set `DEFAULT_REPOSITORY_URL` and omit `repositoryUrl` from events.
-- For multi-service sinks, set `REPOSITORY_URL_MAP` to route by OTEL `service.name`.
+Patrol can ingest OTEL logs directly from a Vector sink (HTTP POST) and analyze them using repository context.
+
+- Full Vector guide: [VECTOR_SINK_CONFIG.md](VECTOR_SINK_CONFIG.md) (currently Korean)
+- Recommended OTEL resource attributes:
+  - `service.name`: used to route to the correct repository with `REPOSITORY_URL_MAP`
+  - `git.repository.url` (or `vcs.repository.url`): lets each event carry the target repo
+  - `git.commit.sha` (or `vcs.ref.head.revision`): lets Patrol fetch code at the right ref (optional)
+- Multi-service sinks:
+  - Set `REPOSITORY_URL_MAP` to route by `service.name` when you cannot attach `git.repository.url`
+  - Fallback: set `DEFAULT_REPOSITORY_URL`
+
+Minimal `vector.toml` example:
+
+```toml
+[sources.otel_receiver]
+type = "opentelemetry"
+address = "0.0.0.0:4317"
+protocol = "grpc"
+
+[transforms.filter_errors]
+type = "filter"
+inputs = ["otel_receiver"]
+condition = '.severity_text == "ERROR"'
+
+[sinks.patrol_lambda]
+type = "http"
+inputs = ["filter_errors"]
+uri = "https://YOUR_API_GATEWAY_URL/patrol"
+method = "post"
+encoding.codec = "json"
+```
